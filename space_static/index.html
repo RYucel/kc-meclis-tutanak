@@ -866,11 +866,12 @@
 <script type="module">
 import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm';
 
-// Deploy to Hugging Face Hub by setting HF_DATASET_REPO = 'stevevaius/KC_Meclis_Tutanak' (empty uses local ./data/)
-const HF_DATASET_REPO = '';
-const DATA_BASE = HF_DATASET_REPO
-  ? `https://huggingface.co/datasets/${HF_DATASET_REPO}/resolve/main/`
-  : new URL('./', location.href).href;
+// Local preview uses ./data/; deployed HF Static Space / custom domain reads from Hugging Face Hub automatically
+const HF_DATASET_REPO = 'stevevaius/KC_Meclis_Tutanak';
+const USE_LOCAL_DATA = ['localhost', '127.0.0.1', ''].includes(location.hostname);
+const DATA_BASE = USE_LOCAL_DATA
+  ? new URL('./', location.href).href
+  : `https://huggingface.co/datasets/${HF_DATASET_REPO}/resolve/main/`;
 const SPEECHES_URL = DATA_BASE + 'data/speeches.parquet';
 const DOCS_URL = DATA_BASE + 'data/documents.parquet';
 const TERMS_CACHE_BASE = DATA_BASE + 'terms_cache/';

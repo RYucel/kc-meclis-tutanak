@@ -25,7 +25,7 @@ def local_is_stale(local: dict, live: dict) -> str | None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo-id", required=True, help="Target HF Static Space, e.g. 'stevevaius/KC-Meclis-Tutanak-Arama'")
+    ap.add_argument("--repo-id", default="stevevaius/KC-Meclis-Tutanak-Arama", help="Target HF Static Space (default: stevevaius/KC-Meclis-Tutanak-Arama)")
     ap.add_argument("--private", action="store_true")
     ap.add_argument("--with-indices", action="store_true")
     ap.add_argument("--force", action="store_true")

@@ -9,7 +9,7 @@ from huggingface_hub import HfApi
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Upload KC Meclis Tutanak dataset to Hugging Face Hub.")
-    ap.add_argument("--repo-id", required=True, help="Target HF dataset repo, e.g. 'stevevaius/KC_Meclis_Tutanak'")
+    ap.add_argument("--repo-id", default="stevevaius/KC_Meclis_Tutanak", help="Target HF dataset repo (default: stevevaius/KC_Meclis_Tutanak)")
     ap.add_argument("--private", action="store_true")
     args = ap.parse_args()
 
