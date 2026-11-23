@@ -873,10 +873,18 @@ const DATA_BASE = USE_LOCAL_DATA
   ? new URL('./', location.href).href
   : `https://huggingface.co/datasets/${HF_DATASET_REPO}/resolve/main/`;
 const SPEECHES_URL = DATA_BASE + 'data/speeches.parquet';
+const ORIG_URL = DATA_BASE + 'data/speeches_original.parquet';
 const DOCS_URL = DATA_BASE + 'data/documents.parquet';
 const TERMS_CACHE_BASE = DATA_BASE + 'terms_cache/';
 const PAGE_SIZE = 25;
 const registeredShards = new Set();
+let origRegistered = false;
+const origTextCache = new Map();
+let searchIdxManifest = null;
+let searchIdxShardSet = new Set();
+let searchIdxStopwords = new Set();
+let searchIdxOmitted = new Set();
+const searchShardCache = new Map();
 
 const QUICK_LEADERS = [
   "Halit Ali Rıza", "Glafkos Kleridis", "Orhan Müderrisoğlu", "Ümit Süleyman Onan",
@@ -949,14 +957,139 @@ function termVariants(tNorm) {
   return ocrVariants[tNorm] || [];
 }
 
-// 1. Load speakers_index.json + terms_index.json + topics_index.json + speaker_topics.json + mp_bios.json in parallel (0ms UI)
+function foldPrefix2(tok) {
+  const f = foldAscii(tok).replace(/[^a-z0-9]/g, '');
+  return f.length >= 2 ? f.slice(0, 2) : (f + '_').slice(0, 2);
+}
+
+function deltaDecode(arr) {
+  const out = [];
+  let acc = 0;
+  for (let i = 0; i < arr.length; i++) {
+    acc += arr[i];
+    out.push(acc);
+  }
+  return out;
+}
+
+async function fetchSearchShard(p2) {
+  if (searchShardCache.has(p2)) return searchShardCache.get(p2);
+  if (!searchIdxShardSet.has(p2)) {
+    searchShardCache.set(p2, {});
+    return {};
+  }
+  const r = await fetch(`./search_idx/${p2}.json`);
+  const j = r.ok ? await r.json() : {};
+  searchShardCache.set(p2, j);
+  return j;
+}
+
+// Resolve candidate speech_ids & speaker_names in <20ms using 2-letter prefix inverted index shards
+async function resolveInvertedCandidates(rawTerms) {
+  if (!searchIdxManifest || !searchIdxManifest.docs || !searchIdxManifest.docs.length) return null;
+  // Extract indexable single-word tokens (>= 3 chars, not stopword, not omitted high-freq)
+  const indexable = [];
+  let hasNonIndexed = false;
+  for (const t of rawTerms) {
+    const tNorm = trLower(t).replace(/ı/g, 'i').trim();
+    if (!tNorm) continue;
+    // Quoted multi-word phrases: intersect their component words as a fast candidate filter, keep SQL contains() for exact order!
+    const parts = tNorm.split(/[^a-z0-9çğöşü]+/).filter(Boolean);
+    if (parts.length > 1) hasNonIndexed = true;
+    for (const p of parts) {
+      if (p.length >= 3 && !searchIdxStopwords.has(p) && !searchIdxOmitted.has(p)) {
+        indexable.push(p);
+      } else {
+        hasNonIndexed = true;
+      }
+    }
+  }
+  if (!indexable.length) return null;
+
+  // Fetch all needed 2-letter prefix shards in parallel (tiny ~1-80 KB each, cached in RAM)
+  const prefixes = [...new Set(indexable.map(foldPrefix2))];
+  const shardList = await Promise.all(prefixes.map(fetchSearchShard));
+  const shardByP2 = new Map(prefixes.map((p, i) => [p, shardList[i]]));
+
+  let intersection = null;
+  for (const tok of indexable) {
+    const p2 = foldPrefix2(tok);
+    const shard = shardByP2.get(p2) || {};
+    const matched = new Set();
+    for (const [k, deltas] of Object.entries(shard)) {
+      if (k.startsWith(tok)) {
+        for (const id of deltaDecode(deltas)) matched.add(id);
+      }
+    }
+    if (matched.size === 0) {
+      return { used: true, empty: true, speechIds: [], speakers: [], terms: [], exact: !hasNonIndexed };
+    }
+    if (intersection === null) {
+      intersection = matched;
+    } else {
+      for (const id of intersection) {
+        if (!matched.has(id)) intersection.delete(id);
+      }
+      if (intersection.size === 0) {
+        return { used: true, empty: true, speechIds: [], speakers: [], terms: [], exact: !hasNonIndexed };
+      }
+    }
+  }
+
+  // Optional year-range pre-filter directly in JS
+  const fy = $('from_year').value.trim();
+  const ty = $('to_year').value.trim();
+  const fyNum = /^\d{4}$/.test(fy) ? Number(fy) : 0;
+  const tyNum = /^\d{4}$/.test(ty) ? Number(ty) : 9999;
+
+  const speechIds = [];
+  const speakerSet = new Set();
+  const termSet = new Set();
+  for (const idx of intersection) {
+    const meta = searchIdxManifest.docs[idx];
+    if (!meta) continue;
+    const yr = meta[3] || 0;
+    if (yr && (yr < fyNum || yr > tyNum)) continue;
+    speechIds.push(meta[0]);
+    const spk = searchIdxManifest.speakers[meta[1]];
+    if (spk) speakerSet.add(spk);
+    const tKey = searchIdxManifest.terms[meta[2]];
+    if (tKey) termSet.add(tKey);
+  }
+  return {
+    used: true,
+    empty: speechIds.length === 0,
+    speechIds,
+    speakers: [...speakerSet],
+    terms: [...termSet],
+    exact: !hasNonIndexed,
+  };
+}
+
+// Lazy-load original Greek text on demand from speeches_original.parquet (keeps hot search Parquet ~50% smaller)
+async function loadOriginalText(speechId) {
+  if (origTextCache.has(speechId)) return origTextCache.get(speechId);
+  const c = await ensureDuckDB();
+  if (!origRegistered) {
+    await db.registerFileURL('speeches_original.parquet', ORIG_URL, duckdb.DuckDBDataProtocol.HTTP, false);
+    origRegistered = true;
+  }
+  const res = await c.query(`SELECT text_original FROM 'speeches_original.parquet' WHERE speech_id = ${sqlQuote(speechId)} LIMIT 1`);
+  const row = res.toArray()[0]?.toJSON();
+  const txt = row ? (row.text_original || '') : '';
+  origTextCache.set(speechId, txt);
+  return txt;
+}
+
+// 1. Load speakers_index.json + terms_index.json + topics_index.json + speaker_topics.json + mp_bios.json + search_idx/manifest.json in parallel
 async function loadIndex() {
-  const [rSpk, rTerms, rTopics, rSpkTopics, rBios] = await Promise.all([
+  const [rSpk, rTerms, rTopics, rSpkTopics, rBios, rSearchIdx] = await Promise.all([
     fetch('./speakers_index.json'),
     fetch('./terms_index.json').catch(() => null),
     fetch('./topics_index.json').catch(() => null),
     fetch('./speaker_topics.json').catch(() => null),
     fetch('./mp_bios.json').catch(() => null),
+    fetch('./search_idx/manifest.json').catch(() => null),
   ]);
   const data = await rSpk.json();
   speakersIndex = data.speakers || [];
@@ -987,6 +1120,13 @@ async function loadIndex() {
   if (rBios && rBios.ok) {
     const bd = await rBios.json();
     mpBios = bd.bios || {};
+  }
+
+  if (rSearchIdx && rSearchIdx.ok) {
+    searchIdxManifest = await rSearchIdx.json();
+    searchIdxShardSet = new Set(searchIdxManifest.shards || []);
+    searchIdxStopwords = new Set(searchIdxManifest.stopwords || []);
+    searchIdxOmitted = new Set(searchIdxManifest.omitted_high_freq || []);
   }
 
   const st = data.stats;
@@ -1029,7 +1169,10 @@ function ensureDuckDB() {
     await db.registerFileURL('speeches.parquet', SPEECHES_URL, duckdb.DuckDBDataProtocol.HTTP, false);
     await db.registerFileURL('documents.parquet', DOCS_URL, duckdb.DuckDBDataProtocol.HTTP, false);
     conn = await db.connect();
-    setEngineStatus('ok', 'Hazır · Konuşmacı bazlı sorgular yalnızca ilgili Parquet bloğunu (~6 MB) doğrudan tarayıcıda okur');
+    const idxNote = searchIdxManifest
+      ? `Ters İndeks (${(searchIdxManifest.token_count||0).toLocaleString('tr-TR')} kelime · ${searchIdxManifest.shard_count} parça) + DuckDB-WASM hazır`
+      : 'Hazır · Konuşmacı bazlı sorgular yalnızca ilgili Parquet bloğunu doğrudan tarayıcıda okur';
+    setEngineStatus('ok', idxNote);
     return conn;
   })().catch(err => {
     setEngineStatus('err', 'DuckDB-WASM hatası: ' + err.message);
@@ -1944,62 +2087,122 @@ async function runSearch(offset = 0) {
     return;
   }
 
-  // Decide optimal Parquet table:
-  // - Single speaker -> speeches.parquet (sorted by speaker_name, ~6 MB range read)
-  // - Specific term (no single speaker) -> terms_cache/{slug}.parquet (~0.2-20 MB instead of 208 MB!)
-  const meclisSel = $('meclis').value.trim();
+  const tStartAll = performance.now();
+  const rawQTerms = parseQueryTerms($('q').value);
+
+  // Fast Path 1: Prefix-sharded serverless inverted index (<20ms, fetches only ~2-80 KB shard(s))
+  let inv = null;
+  if (rawQTerms.length > 0 && !activeTopicFilter) {
+    try {
+      inv = await resolveInvertedCandidates(rawQTerms);
+    } catch (_) {
+      inv = null;
+    }
+  }
+  if (inv && inv.empty) {
+    const ms0 = Math.round(performance.now() - tStartAll);
+    setEngineStatus('ok', `Son sorgu ${ms0} ms · Ters İndeks (0 eşleşme, Parquet taranmadı)`);
+    $('results-count').textContent = `0 konuşma bulundu (${ms0} ms)`;
+    $('btn-export').style.display = 'none';
+    $('results').innerHTML = `<div class="empty-state"><strong>Sonuç bulunamadı.</strong><br>Farklı bir anahtar kelime veya daha geniş bir tarih aralığı deneyin.</div>`;
+    $('pager').innerHTML = '';
+    return;
+  }
+
+  // Build pruned WHERE SQL when inverted index narrowed candidates to <= 500 speech_ids
+  let effectiveWhere = w.sql;
+  let prunedByIndex = false;
+  if (inv && inv.speechIds.length > 0 && inv.speechIds.length <= 500) {
+    const idList = inv.speechIds.map(sqlQuote).join(', ');
+    const spkList = inv.speakers.length > 0 && inv.speakers.length <= 80
+      ? `speaker_name IN (${inv.speakers.map(sqlQuote).join(', ')}) AND `
+      : '';
+    // Keep original w.sql as verification (fast over <=500 candidate rows!) while speaker_name IN prunes Parquet row groups
+    effectiveWhere = `${spkList}speech_id IN (${idList}) AND (${w.sql})`;
+    prunedByIndex = true;
+  }
+
+  // Fast Path 2: Automatic Term & Year-Range Shard Routing (`terms_cache/KC_{d}.parquet`)
   const donemSel = $('donem').value.trim();
-  let targetTable = 'speeches.parquet';
-  let shardFname = null;
-  if (w.resolved.length !== 1 && meclisSel) {
-    const tid = (donemSel && /^\d+$/.test(donemSel)) ? `${meclisSel}:${donemSel}` : meclisSel;
-    if (termsById.has(tid) || topicTermsById.has(tid)) {
-      const tMeta = termsById.get(tid) || topicTermsById.get(tid);
-      shardFname = tMeta.donem != null ? `${tMeta.meclis}_${tMeta.donem}.parquet` : `${tMeta.meclis}.parquet`;
-      targetTable = `term_${shardFname}`;
+  const fySel = $('from_year').value.trim();
+  const tySel = $('to_year').value.trim();
+  let shardFnames = [];
+  if (w.resolved.length !== 1) {
+    if (donemSel && /^\d+$/.test(donemSel)) {
+      const tid = `KC:${donemSel}`;
+      if (termsById.has(tid) || topicTermsById.has(tid)) shardFnames = [`KC_${donemSel}.parquet`];
+    } else if (/^\d{4}$/.test(fySel) || /^\d{4}$/.test(tySel)) {
+      const fyN = /^\d{4}$/.test(fySel) ? Number(fySel) : 0;
+      const tyN = /^\d{4}$/.test(tySel) ? Number(tySel) : 9999;
+      const overlapping = termsData.filter(t => {
+        const y0 = Number((t.min_date || t.years || '1960').slice(0, 4)) || 1960;
+        const y1 = Number((t.max_date || (t.years || '').slice(-4) || '2026').slice(0, 4)) || 2026;
+        return y1 >= fyN && y0 <= tyN;
+      });
+      if (overlapping.length >= 1 && overlapping.length < termsData.length && overlapping.length <= 3) {
+        shardFnames = overlapping.map(t => t.donem != null ? `${t.meclis}_${t.donem}.parquet` : `${t.meclis}.parquet`);
+      }
+    } else if (inv && inv.terms.length >= 1 && inv.terms.length < termsData.length && inv.terms.length <= 3) {
+      shardFnames = inv.terms.map(t => `${t}.parquet`);
     }
   }
 
-  const fastHint = w.resolved.length === 1
-    ? `${w.resolved[0]} için ilgili Parquet bloğu (~6 MB) okunuyor...`
-    : shardFname
-      ? `Yalnızca seçili dönemin Parquet dosyası (${shardFname}) taranıyor...`
-      : 'Tüm arşiv üzerinde Parquet sorgusu çalıştırılıyor (konuşmacı veya dönem seçerseniz çok daha hızlıdır)...';
+  let fromExpr = `'speeches.parquet'`;
+  if (shardFnames.length === 1) {
+    fromExpr = `'term_${shardFnames[0]}'`;
+  } else if (shardFnames.length > 1) {
+    fromExpr = `read_parquet([${shardFnames.map(f => sqlQuote('term_' + f)).join(', ')}])`;
+  }
+
+  const fastHint = prunedByIndex
+    ? `Ters indeks ${inv.speechIds.length} aday konuşma buldu · yalnızca eşleşen satırlar okunuyor...`
+    : w.resolved.length === 1
+      ? `${w.resolved[0]} için ilgili Parquet bloğu okunuyor...`
+      : shardFnames.length
+        ? `Yalnızca ilgili dönem parçası (${shardFnames.join(', ')}) taranıyor...`
+        : 'Parquet sorgusu çalıştırılıyor...';
   $('results').innerHTML = `<div class="loading-box"><div class="spinner"></div><div><strong>Sorgulanıyor...</strong><div style="font-size:13px;color:var(--ink-soft);margin-top:2px">${escHtml(fastHint)}</div></div></div>`;
   $('btn-submit').disabled = true;
   setEngineStatus('busy', fastHint);
 
   try {
     const c = await ensureDuckDB();
-    if (shardFname && !registeredShards.has(targetTable)) {
-      await db.registerFileURL(targetTable, TERMS_CACHE_BASE + shardFname, duckdb.DuckDBDataProtocol.HTTP, false);
-      registeredShards.add(targetTable);
+    for (const sf of shardFnames) {
+      const regName = `term_${sf}`;
+      if (!registeredShards.has(regName)) {
+        await db.registerFileURL(regName, TERMS_CACHE_BASE + sf, duckdb.DuckDBDataProtocol.HTTP, false);
+        registeredShards.add(regName);
+      }
     }
-    const t0 = performance.now();
     const sortVal = $('sort').value;
     const orderSql = sortVal === 'oldest' ? 'tarih ASC NULLS LAST, turn_index ASC'
                    : sortVal === 'longest' ? 'word_count DESC, tarih DESC NULLS LAST'
                    : 'tarih DESC NULLS LAST, turn_index ASC';
 
-    // Single-pass query with window COUNT(*) OVER() avoids scanning the Parquet file twice!
+    // Single-pass query on skinny speeches.parquet (without heavy text_original!)
     const rowsRes = await c.query(`
       SELECT COUNT(*) OVER()::DOUBLE AS _total,
              speech_id, doc_id, meclis, donem, birlesim, oturum, tarih, turn_index,
              speaker_name, speaker_title, constituency, modifiers, speaker_role,
-             text, text_original, language, community, page_start, page_end,
+             text, language, community, page_start, page_end, has_original,
              word_count, source_file, source_url
-      FROM '${targetTable}'
-      WHERE ${w.sql}
+      FROM ${fromExpr}
+      WHERE ${effectiveWhere}
       ORDER BY ${orderSql}
       LIMIT ${PAGE_SIZE} OFFSET ${offset}
     `);
     const rows = rowsRes.toArray().map(r => r.toJSON());
     const total = rows.length ? Number(rows[0]._total || 0) : 0;
-    const ms = Math.round(performance.now() - t0);
-    lastQueryState = { table: targetTable, whereSql: w.sql, orderSql, terms: w.terms };
+    const ms = Math.round(performance.now() - tStartAll);
+    lastQueryState = { fromExpr, whereSql: effectiveWhere, orderSql, terms: w.terms };
     lastItems = rows;
 
-    setEngineStatus('ok', `Son sorgu ${ms.toLocaleString('tr-TR')} ms · DuckDB-WASM (sunucusuz)`);
+    const modeTag = prunedByIndex
+      ? `Ters İndeks (${inv.speechIds.length} aday) + DuckDB-WASM`
+      : shardFnames.length
+        ? `Dönem Shard (${shardFnames.length}) + DuckDB-WASM`
+        : 'DuckDB-WASM (sunucusuz)';
+    setEngineStatus('ok', `Son sorgu ${ms.toLocaleString('tr-TR')} ms · ${modeTag}`);
     const fromN = total ? offset + 1 : 0;
     const toN = Math.min(offset + rows.length, total);
     $('results-count').textContent = `${total.toLocaleString('tr-TR')} konuşma bulundu (${ms} ms)` +
@@ -2009,7 +2212,7 @@ async function runSearch(offset = 0) {
     if (!rows.length) {
       const spkProf = w.resolved.length === 1 ? speakersByName.get(w.resolved[0]) : null;
       const hint = spkProf && spkProf.s > 0
-        ? `<br><strong>${escHtml(spkProf.n)}</strong> için arşivde toplam <strong>${spkProf.s.toLocaleString('tr-TR')}</strong> konuşma (${(spkProf.a||'?').slice(0,4)}–${(spkProf.b||'?').slice(0,4)}) bulunuyor; ancak seçili Meclis/Yıl/Kelime filtresiyle eşleşme yok.`
+        ? `<br><strong>${escHtml(spkProf.n)}</strong> için arşivde toplam <strong>${spkProf.s.toLocaleString('tr-TR')}</strong> konuşma (${(spkProf.a||'?').slice(0,4)}–${(spkProf.b||'?').slice(0,4)}) bulunuyor; ancak seçili Yıl/Dil/Kelime filtresiyle eşleşme yok.`
         : '<br>Farklı bir anahtar kelime veya daha geniş bir tarih aralığı deneyin.';
       $('results').innerHTML = `<div class="empty-state"><strong>Sonuç bulunamadı.</strong>${hint}</div>`;
       $('pager').innerHTML = '';
@@ -2023,7 +2226,7 @@ async function runSearch(offset = 0) {
       const langBadge = isGreek
         ? `<span class="lang-badge el" title="Orijinal zabıt Yunancadır; Kıbrıs Türk okuyucular için sadık Türkçeye çevrilmiştir">Yunanca → Türkçe</span>`
         : `<span class="lang-badge tr" title="1960–1963 tutanaklarındaki orijinal Türkçe kayıt">Orijinal Türkçe</span>`;
-      const hasOrigToggle = isGreek && it.text_original && it.text_original !== it.text;
+      const hasOrigToggle = Boolean(it.has_original || isGreek);
       return `
         <article class="speech-card">
           <div class="sc-head">
@@ -2043,7 +2246,7 @@ async function runSearch(offset = 0) {
           ${hasOrigToggle ? `
             <div class="orig-box" id="orig-box-${idx}">
               <div class="orig-box-lbl">Orijinal Yunanca Zabıt Metni (${escHtml(pgStr || 'parliament.cy')})</div>
-              <div class="orig-box-text">${escHtml(it.text_original)}</div>
+              <div class="orig-box-text" id="orig-text-${idx}">Yükleniyor...</div>
             </div>
           ` : ''}
           <div class="sc-foot">
@@ -2088,7 +2291,7 @@ const MECLIS_FULL = {
   KC: 'Kıbrıs Cumhuriyeti Temsilciler Meclisi',
 };
 const SPEECH_COLS = `speech_id, doc_id, meclis, donem, birlesim, oturum, tarih, turn_index,
-  speaker_name, speaker_title, constituency, modifiers, speaker_role, text, text_original, language, community, page_start, page_end, word_count, source_file, source_url`;
+  speaker_name, speaker_title, constituency, modifiers, speaker_role, text, language, community, page_start, page_end, has_original, word_count, source_file, source_url`;
 
 function speechPermalink(item) {
   const p = new URLSearchParams();
@@ -2191,6 +2394,7 @@ async function openSpeechById(id, speaker) {
 function openSpeechDrawer(item) {
   $('drawer-backdrop').classList.add('open');
   setSpeechParam(item.speech_id);
+  const showOrig = Boolean(item.has_original || item.language === 'el');
   $('drawer-title').textContent = `${item.speaker_name} · ${item.tarih ? formatDateTR(item.tarih) : 'Tarihsiz'}`;
   $('drawer-sub').innerHTML = `${escHtml(item.meclis)} ${item.donem ? 'Dönem ' + item.donem : ''} ${item.birlesim ? item.birlesim + '. Birleşim' : ''} · <a href="${escHtml(item.source_url)}" target="_blank" rel="noopener" style="color:var(--crimson)">${escHtml(item.source_file)} ↗</a>`;
   $('drawer-body').innerHTML = `
@@ -2207,10 +2411,10 @@ function openSpeechDrawer(item) {
         ${item.speaker_title ? escHtml(item.speaker_title) + ' · ' : ''}${item.page_start ? 'PDF s.' + item.page_start + (item.page_end && item.page_end !== item.page_start ? '–' + item.page_end : '') + ' · ' : ''}Konuşma #${item.turn_index} · ${Number(item.word_count||0).toLocaleString('tr-TR')} kelime · ${item.language === 'el' ? 'Yunanca → Türkçe Çeviri' : 'Orijinal Türkçe'}
       </div>
       <div class="ctx-text">${escHtml(item.text)}</div>
-      ${item.language === 'el' && item.text_original && item.text_original !== item.text ? `
+      ${showOrig ? `
         <div class="orig-box open" style="margin-top:14px">
           <div class="orig-box-lbl">Orijinal Yunanca Zabıt Metni (Doğrulama İçin)</div>
-          <div class="orig-box-text">${escHtml(item.text_original)}</div>
+          <div class="orig-box-text" id="drawer-orig-text">Orijinal Yunanca metin yükleniyor...</div>
         </div>
       ` : ''}
     </div>
@@ -2219,6 +2423,15 @@ function openSpeechDrawer(item) {
       <div id="full-doc-slot"></div>
     </div>
   `;
+  if (showOrig) {
+    loadOriginalText(item.speech_id).then(origTxt => {
+      const el = $('drawer-orig-text');
+      if (el) el.textContent = origTxt || 'Orijinal metin bulunamadı.';
+    }).catch(err => {
+      const el = $('drawer-orig-text');
+      if (el) el.textContent = 'Yükleme hatası: ' + err.message;
+    });
+  }
   $('drawer-cite').onclick = e => citeItem(item, e.currentTarget);
   $('drawer-link').onclick = e => shareOrCopyLink(item, e.currentTarget);
   $('load-full-doc').onclick = async () => {
@@ -2235,19 +2448,30 @@ function openSpeechDrawer(item) {
   };
 }
 
-// Export CSV client-side
+// Export CSV client-side (joins speeches_original.parquet lazily on export)
 $('btn-export').onclick = async () => {
   if (!lastQueryState) return;
   $('btn-export').textContent = 'Hazırlanıyor...';
   try {
     const c = await ensureDuckDB();
+    if (!origRegistered) {
+      await db.registerFileURL('speeches_original.parquet', ORIG_URL, duckdb.DuckDBDataProtocol.HTTP, false);
+      origRegistered = true;
+    }
     const res = await c.query(`
-      SELECT tarih, meclis, donem, birlesim, oturum, turn_index,
-             speaker_name, speaker_title, constituency, community, language, page_start, word_count, text, text_original, source_url
-      FROM '${lastQueryState.table || 'speeches.parquet'}'
-      WHERE ${lastQueryState.whereSql}
-      ORDER BY ${lastQueryState.orderSql}
-      LIMIT 500
+      WITH sel AS (
+        SELECT speech_id, tarih, meclis, donem, birlesim, oturum, turn_index,
+               speaker_name, speaker_title, constituency, community, language, page_start, word_count, text, source_url
+        FROM ${lastQueryState.fromExpr || "'speeches.parquet'"}
+        WHERE ${lastQueryState.whereSql}
+        ORDER BY ${lastQueryState.orderSql}
+        LIMIT 500
+      )
+      SELECT sel.tarih, sel.meclis, sel.donem, sel.birlesim, sel.oturum, sel.turn_index,
+             sel.speaker_name, sel.speaker_title, sel.constituency, sel.community, sel.language,
+             sel.page_start, sel.word_count, sel.text, COALESCE(o.text_original, sel.text) AS text_original, sel.source_url
+      FROM sel
+      LEFT JOIN 'speeches_original.parquet' o ON sel.speech_id = o.speech_id
     `);
     const rows = res.toArray().map(r => r.toJSON());
     const cols = ['tarih','meclis','donem','birlesim','oturum','turn_index','speaker_name','speaker_title','constituency','community','language','page_start','word_count','text','text_original','source_url'];
@@ -2305,7 +2529,7 @@ $('ac-dropdown').onclick = e => {
 };
 document.addEventListener('click', e => { if (!e.target.closest('.ac-wrap')) $('ac-dropdown').style.display = 'none'; });
 
-$('results').onclick = e => {
+$('results').onclick = async e => {
   const pick = e.target.closest('[data-pick]');
   if (pick) {
     $('speaker').value = pick.dataset.pick;
@@ -2318,10 +2542,23 @@ $('results').onclick = e => {
   if (rd) { openSpeechDrawer(lastItems[Number(rd.dataset.idx)]); return; }
   const ob = e.target.closest('.orig-btn');
   if (ob) {
-    const box = $('orig-box-' + ob.dataset.idx);
+    const idx = Number(ob.dataset.idx);
+    const item = lastItems[idx];
+    const box = $('orig-box-' + idx);
+    const txtEl = $('orig-text-' + idx);
     if (box) {
       const open = box.classList.toggle('open');
       ob.textContent = open ? 'Orijinal Yunancayı Gizle ▴' : 'Orijinal Yunanca ▾';
+      if (open && item && txtEl && !box.dataset.loaded) {
+        txtEl.textContent = 'Orijinal Yunanca metin yükleniyor...';
+        try {
+          const origTxt = await loadOriginalText(item.speech_id);
+          txtEl.textContent = origTxt || 'Orijinal metin bulunamadı.';
+          box.dataset.loaded = '1';
+        } catch (err) {
+          txtEl.textContent = 'Yükleme hatası: ' + err.message;
+        }
+      }
     }
     return;
   }

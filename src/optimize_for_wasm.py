@@ -293,17 +293,51 @@ def main() -> None:
         raise SystemExit("Run `python src/build_dataset.py` first.")
 
     con = duckdb.connect()
-    # Re-pack speeches sorted by speaker_name, tarih DESC with compact row groups
-    sp_tmp = HF_DATA / "speeches.opt.parquet"
-    con.execute(
-        f"""
-        COPY (
-            SELECT * FROM read_parquet('{sp_in}')
-            ORDER BY speaker_name ASC, tarih DESC NULLS LAST, turn_index ASC
-        ) TO '{sp_tmp}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 10000)
-        """
-    )
-    sp_tmp.replace(sp_in)
+
+    # Check whether input speeches.parquet still contains text_original (idempotent re-runs!)
+    cols = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{sp_in}')").fetchall()}
+    orig_out = HF_DATA / "speeches_original.parquet"
+
+    if "text_original" in cols:
+        # 1. Extract original Greek/bilingual verbatim texts into a separate speech_id-sorted Parquet
+        #    so hot search queries NEVER download Greek text unless user clicks "Orijinal Yunanca" or opens Drawer!
+        orig_tmp = HF_DATA / "speeches_original.opt.parquet"
+        con.execute(
+            f"""
+            COPY (
+                SELECT speech_id, language, text_original
+                FROM read_parquet('{sp_in}')
+                WHERE text_original IS NOT NULL AND text_original <> '' AND language <> 'tr'
+                ORDER BY speech_id ASC
+            ) TO '{orig_tmp}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 2000)
+            """
+        )
+        orig_tmp.replace(orig_out)
+
+        # 2. Re-pack hot speeches.parquet WITHOUT text_original (adds tiny has_original boolean)
+        sp_tmp = HF_DATA / "speeches.opt.parquet"
+        con.execute(
+            f"""
+            COPY (
+                SELECT * EXCLUDE (text_original),
+                       (language <> 'tr' AND text_original IS NOT NULL AND text_original <> '' AND text_original <> text) AS has_original
+                FROM read_parquet('{sp_in}')
+                ORDER BY speaker_name ASC, tarih DESC NULLS LAST, turn_index ASC
+            ) TO '{sp_tmp}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 10000)
+            """
+        )
+        sp_tmp.replace(sp_in)
+    else:
+        sp_tmp = HF_DATA / "speeches.opt.parquet"
+        con.execute(
+            f"""
+            COPY (
+                SELECT * FROM read_parquet('{sp_in}')
+                ORDER BY speaker_name ASC, tarih DESC NULLS LAST, turn_index ASC
+            ) TO '{sp_tmp}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 10000)
+            """
+        )
+        sp_tmp.replace(sp_in)
 
     doc_tmp = HF_DATA / "documents.opt.parquet"
     con.execute(
@@ -316,7 +350,7 @@ def main() -> None:
     )
     doc_tmp.replace(doc_in)
 
-    # Build per-term Parquet shards
+    # Build per-term skinny Parquet shards (sorted by tarih DESC for fast chronological term scans)
     active_terms = con.execute(
         f"SELECT DISTINCT meclis, donem FROM read_parquet('{sp_in}') ORDER BY 1, 2"
     ).fetchall()
@@ -350,15 +384,24 @@ def main() -> None:
         local_data.mkdir(parents=True, exist_ok=True)
         local_cache.mkdir(parents=True, exist_ok=True)
         shutil.copy2(sp_in, local_data / "speeches.parquet")
+        if orig_out.exists():
+            shutil.copy2(orig_out, local_data / "speeches_original.parquet")
         shutil.copy2(doc_in, local_data / "documents.parquet")
         for f in TERMS_CACHE.glob("*.parquet"):
             shutil.copy2(f, local_cache / f.name)
         print(f"Mirrored local Parquet files into {local_data}/ and {local_cache}/")
 
     con.close()
+
+    # Build prefix-sharded serverless inverted index for instant keyword lookup
+    from build_search_index import build_inverted_index
+    build_inverted_index(sp_in, STATIC_SPACE / "search_idx")
+
+    orig_kb = (orig_out.stat().st_size / 1024) if orig_out.exists() else 0.0
     print(
-        f"Optimized Parquet + built speakers_index.json ({len(spk_idx['speakers'])} speakers) "
-        f"& terms_index.json ({len(terms_idx['terms'])} terms) in {time.time() - t0:.2f}s."
+        f"Optimized Parquet (speeches={sp_in.stat().st_size/1024:.1f} KB, "
+        f"speeches_original={orig_kb:.1f} KB) + built indices ({len(spk_idx['speakers'])} speakers, "
+        f"{len(terms_idx['terms'])} terms) in {time.time() - t0:.2f}s."
     )
 
 

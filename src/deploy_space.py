@@ -51,6 +51,8 @@ def main() -> None:
             if reason:
                 raise SystemExit(f"Refusing to upload indices: {reason}. Pass --force to override.")
         patterns += list(INDEX_FILES)
+        if (space_dir / "search_idx/manifest.json").exists():
+            patterns.append("search_idx/**")
 
     api.upload_folder(
         folder_path=str(space_dir),

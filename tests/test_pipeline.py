@@ -79,8 +79,9 @@ def test_cross_script_speaker_resolution():
 
 def test_parquet_and_static_indices_consistency():
     sp_path = ROOT / "space_static/data/speeches.parquet"
+    orig_path = ROOT / "space_static/data/speeches_original.parquet"
     doc_path = ROOT / "space_static/data/documents.parquet"
-    assert sp_path.exists() and doc_path.exists()
+    assert sp_path.exists() and orig_path.exists() and doc_path.exists()
 
     spk_idx = json.loads((ROOT / "space_static/speakers_index.json").read_text(encoding="utf-8"))
     terms_idx = json.loads((ROOT / "space_static/terms_index.json").read_text(encoding="utf-8"))
@@ -89,11 +90,17 @@ def test_parquet_and_static_indices_consistency():
     bios = json.loads((ROOT / "space_static/mp_bios.json").read_text(encoding="utf-8"))
 
     con = duckdb.connect()
+    sp_cols = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{sp_path}')").fetchall()}
+    assert "text_original" not in sp_cols, "Hot speeches.parquet must stay skinny without text_original!"
+    assert "has_original" in sp_cols
+
     n_sp = con.execute(f"SELECT COUNT(*) FROM read_parquet('{sp_path}')").fetchone()[0]
     n_el = con.execute(f"SELECT COUNT(*) FROM read_parquet('{sp_path}') WHERE language = 'el'").fetchone()[0]
     n_tr = con.execute(f"SELECT COUNT(*) FROM read_parquet('{sp_path}') WHERE language = 'tr'").fetchone()[0]
+    n_orig = con.execute(f"SELECT COUNT(*) FROM read_parquet('{orig_path}')").fetchone()[0]
     assert n_sp == spk_idx["stats"]["speeches"] == 104
     assert n_el > 50 and n_tr > 30
+    assert n_orig == n_el
 
     # Every speech's primary `text` field must be Turkish readable (no untranslated Greek blocks)
     untranslated = con.execute(
@@ -101,9 +108,9 @@ def test_parquet_and_static_indices_consistency():
     ).fetchone()[0]
     assert untranslated == 0, "All speeches must be readable in Turkish!"
 
-    # Every Greek speech must retain its verbatim Greek original in `text_original`
+    # Every Greek speech in speeches_original.parquet must retain its verbatim Greek original
     missing_orig = con.execute(
-        f"SELECT COUNT(*) FROM read_parquet('{sp_path}') WHERE language = 'el' AND NOT regexp_matches(text_original, '[Α-Ωα-ω]')"
+        f"SELECT COUNT(*) FROM read_parquet('{orig_path}') WHERE NOT regexp_matches(text_original, '[Α-Ωα-ω]')"
     ).fetchone()[0]
     assert missing_orig == 0
 
@@ -118,4 +125,43 @@ def test_parquet_and_static_indices_consistency():
     assert len(terms_idx["terms"]) >= 1
     assert "topic_ids" in spk_topics and "Glafkos Kleridis" in spk_topics["speakers"]
     assert "bios" in bios and "Halit Ali Rıza" in bios["bios"]
+    con.close()
+
+
+def test_serverless_inverted_index_recall():
+    from build_search_index import delta_decode, fold_prefix, norm_tr_i
+
+    idx_dir = ROOT / "space_static/search_idx"
+    manifest = json.loads((idx_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["doc_count"] == 104
+    assert manifest["token_count"] > 1000
+    assert manifest["shard_count"] > 50
+
+    def query_idx(words: list[str]) -> set[str]:
+        inter = None
+        for w in words:
+            wn = norm_tr_i(w)
+            p2 = fold_prefix(wn)
+            shard = json.loads((idx_dir / f"{p2}.json").read_text(encoding="utf-8"))
+            hits = set()
+            for tok, deltas in shard.items():
+                if tok.startsWith(wn) if hasattr(tok, "startsWith") else tok.startswith(wn):
+                    for idx in delta_decode(deltas):
+                        hits.add(manifest["docs"][idx][0])
+            inter = hits if inter is None else (inter & hits)
+        return inter or set()
+
+    con = duckdb.connect()
+    sp_path = ROOT / "space_static/data/speeches.parquet"
+    for q_words in [["forsthoff"], ["anayasa"], ["tercüme"], ["üzüm"], ["anayasa", "tercüme"]]:
+        idx_hits = query_idx(q_words)
+        cond = " AND ".join(
+            f"contains(replace(lower(text), 'ı', 'i'), '{norm_tr_i(w)}')" for w in q_words
+        )
+        sql_hits = {
+            r[0]
+            for r in con.execute(f"SELECT speech_id FROM read_parquet('{sp_path}') WHERE {cond}").fetchall()
+        }
+        assert len(idx_hits) > 0, f"Expected hits for {q_words}"
+        assert sql_hits.issubset(idx_hits), f"Inverted index missed SQL hits for {q_words}: {sql_hits - idx_hits}"
     con.close()
