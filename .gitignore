@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+data/raw/*.pdf
+data/extracted/
+data/parsed/
+data/reocr/
+data/translations/
+data/hf_dataset/
+data/search.db
+*.log
+.env
